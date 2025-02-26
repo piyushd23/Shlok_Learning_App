@@ -1,0 +1,4 @@
+Flask
+whisper
+torch
+thefuzz
