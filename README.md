@@ -130,6 +130,3 @@ _If an error occurs:_
 ## Contributing
 Feel free to contribute by submitting issues or pull requests.
 
-## License
-This project is licensed under the MIT License.
-
