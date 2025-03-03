@@ -1,228 +1,165 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import whisper
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import json
+import threading
 import pyttsx3
-import os
-import speech_recognition as sr
-from difflib import SequenceMatcher
-import asyncio
-import functools
-import time
-import logging
-from contextlib import contextmanager
-import traceback
-
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import requests
+from typing import List, Dict, Optional
 
 app = FastAPI()
 
-# Add CORS middleware to handle frontend interruptions
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify actual origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Initialize text-to-speech engine
+engine = pyttsx3.init()
 
-# Initialize with error handling
-try:
-    engine = pyttsx3.init()
-    model = whisper.load_model("base")  # Load Whisper model
-    recognizer = sr.Recognizer()
-    logger.info("Successfully initialized all components")
-except Exception as e:
-    logger.error(f"Failed to initialize components: {str(e)}")
-    # We'll create fallback mechanisms later
-
-# Pre-stored song list
+# Sample song lyrics storage
 songs = {
-    "song1": ["hello", "world"],
-    "song2": ["fast", "API"]
+    "twinkle": ["Twinkle", "twinkle", "little", "star", "how", "I", "wonder", "what", "you", "are"],
+    "abc": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"],
+    "row_boat": ["Row", "row", "row", "your", "boat", "gently", "down", "the", "stream"]
 }
 
-# Timeout decorator to handle long-running operations
-def timeout_handler(seconds):
-    def decorator(func):
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            try:
-                # For async functions
-                if asyncio.iscoroutinefunction(func):
-                    return await asyncio.wait_for(func(*args, **kwargs), timeout=seconds)
-                # For sync functions
-                else:
-                    return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=seconds)
-            except asyncio.TimeoutError:
-                logger.error(f"Function {func.__name__} timed out after {seconds} seconds")
-                raise HTTPException(status_code=504, detail="Operation timed out")
-            except Exception as e:
-                logger.error(f"Error in {func.__name__}: {str(e)}")
-                raise HTTPException(status_code=500, detail=str(e))
-        return wrapper
-    return decorator
+# Track current song and word position for each session
+sessions = {}
 
-# Resource cleanup context manager
-@contextmanager
-def resource_cleanup(resource_name, resource=None):
-    try:
-        yield
-    except Exception as e:
-        logger.error(f"Error with {resource_name}: {str(e)}")
-        # Implement specific cleanup based on resource type
-        if resource_name == "temp_file" and resource:
-            try:
-                if os.path.exists(resource):
-                    os.remove(resource)
-                    logger.info(f"Cleaned up {resource}")
-            except Exception as cleanup_error:
-                logger.error(f"Failed to clean up {resource}: {str(cleanup_error)}")
-        raise
-    finally:
-        # Always execute cleanup for specific resources
-        if resource_name == "temp_file" and resource:
-            try:
-                if os.path.exists(resource):
-                    os.remove(resource)
-                    logger.info(f"Cleaned up {resource}")
-            except Exception as e:
-                logger.error(f"Failed in finally block to clean up {resource}: {str(e)}")
+class SessionData(BaseModel):
+    song_id: str
+    current_position: int = 0
+    completed: bool = False
 
-def similarity_ratio(str1, str2):
-    return SequenceMatcher(None, str1, str2).ratio()
+class VerificationResult(BaseModel):
+    is_correct: bool
+    message: Optional[str] = None
 
-# Global exception handler
-@app.middleware("http")
-async def catch_exceptions_middleware(request: Request, call_next):
-    try:
-        return await call_next(request)
-    except Exception as e:
-        logger.error(f"Global exception: {str(e)}\n{traceback.format_exc()}")
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "An internal server error occurred", "error": str(e)}
-        )
-
-# Health check endpoint to verify service is running
-@app.get("/health")
-def health_check():
-    return {"status": "healthy", "timestamp": time.time()}
-
-@app.get("/songs")
-def get_songs():
-    try:
-        return {"songs": list(songs.keys())}
-    except Exception as e:
-        logger.error(f"Error fetching songs: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve songs: {str(e)}")
-
-@app.get("/song/{song_name}")
-def get_song_words(song_name: str):
-    try:
-        if song_name not in songs:
-            raise HTTPException(status_code=404, detail="Song not found")
-        return {"words": songs[song_name]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching song {song_name}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve song details: {str(e)}")
-
-@app.get("/pronounce/{word}")
-@timeout_handler(10)  # Set appropriate timeout
-async def pronounce_word(word: str):
-    try:
-        def say_word():
-            engine.say(word)
-            engine.runAndWait()
-            
-        # Run text-to-speech in a separate thread to prevent blocking
-        await asyncio.to_thread(say_word)
-        return {"message": f"Pronounced {word}"}
-    except Exception as e:
-        logger.error(f"Error pronouncing word {word}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to pronounce word: {str(e)}")
-
-@app.post("/verify")
-@timeout_handler(30)  # Speech recognition may take longer
-async def verify_pronunciation():
-    temp_file = "temp.wav"
+@app.post("/start_song/{song_id}")
+def start_song(song_id: str):
+    if song_id not in songs:
+        raise HTTPException(status_code=404, detail="Song not found")
     
-    try:
-        with resource_cleanup("temp_file", temp_file):
-            # Recording audio
-            try:
-                audio_data = await asyncio.to_thread(record_audio)
-            except Exception as e:
-                logger.error(f"Error recording audio: {str(e)}")
-                raise HTTPException(status_code=500, detail="Failed to record audio")
-            
-            # Save audio file
-            try:
-                with open(temp_file, "wb") as f:
-                    f.write(audio_data.get_wav_data())
-            except Exception as e:
-                logger.error(f"Error saving audio file: {str(e)}")
-                raise HTTPException(status_code=500, detail="Failed to save audio file")
-            
-            # Transcribe with Whisper
-            try:
-                result = await asyncio.to_thread(lambda: model.transcribe(temp_file))
-                recognized_text = result["text"].strip().lower()
-            except Exception as e:
-                logger.error(f"Error transcribing audio: {str(e)}")
-                raise HTTPException(status_code=500, detail="Failed to transcribe audio")
-            
-            # Compare with correct words
-            correct_words = [word.lower() for word in songs.get("song1", [])]
-            best_match = max(correct_words, key=lambda w: similarity_ratio(w, recognized_text))
-            similarity = similarity_ratio(best_match, recognized_text)
-            
+    # Create a new session
+    session_id = f"session_{len(sessions) + 1}"
+    sessions[session_id] = SessionData(song_id=song_id)
+    
+    # Get the first word
+    first_word = songs[song_id][0]
+    
+    # Return session info and first word
+    return {
+        "session_id": session_id,
+        "song_id": song_id,
+        "current_word": first_word,
+        "position": 0,
+        "total_words": len(songs[song_id])
+    }
+
+@app.get("/pronounce/{session_id}")
+def pronounce_word(session_id: str):
+    # Check if session exists
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session = sessions[session_id]
+    
+    # Check if song is completed
+    if session.completed:
+        return {"message": "Song completed", "completed": True}
+    
+    # Get the current word
+    song_lyrics = songs[session.song_id]
+    current_word = song_lyrics[session.current_position]
+    
+    # Create JSON representation and print to console
+    word_data = {"word": current_word}
+    json_data = json.dumps(word_data)
+    print(json_data)
+    
+    # Pronounce word in a separate thread
+    def speak():
+        engine.say(current_word)
+        engine.runAndWait()
+    
+    threading.Thread(target=speak, daemon=True).start()
+    
+    return {
+        "message": f"Pronouncing word: {current_word}",
+        "current_word": current_word,
+        "position": session.current_position,
+        "total_words": len(song_lyrics),
+        "session_id": session_id
+    }
+
+@app.post("/verify/{session_id}")
+def verify_pronunciation(session_id: str, result: VerificationResult):
+    # Check if session exists
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session = sessions[session_id]
+    
+    # Check if song is already completed
+    if session.completed:
+        return {"message": "Song already completed", "completed": True}
+    
+    # Get the song lyrics
+    song_lyrics = songs[session.song_id]
+    current_word = song_lyrics[session.current_position]
+    
+    if result.is_correct:
+        # Move to the next word
+        session.current_position += 1
+        
+        # Check if we've reached the end of the song
+        if session.current_position >= len(song_lyrics):
+            session.completed = True
             return {
-                "recognized": recognized_text, 
-                "correct": similarity >= 0.8, 
-                "similarity": similarity, 
-                "best_match": best_match
+                "message": "Pronunciation correct. Song completed!",
+                "completed": True,
+                "next_word": None
             }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in verify_pronunciation: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)}")
+        
+        # Get the next word
+        next_word = song_lyrics[session.current_position]
+        
+        return {
+            "message": f"Pronunciation correct. Moving to next word: {next_word}",
+            "completed": False,
+            "next_word": next_word,
+            "position": session.current_position,
+            "total_words": len(song_lyrics)
+        }
+    else:
+        # If verification failed, stay on the same word
+        return {
+            "message": "Pronunciation incorrect. Please try again.",
+            "completed": False,
+            "next_word": current_word,  # Stay on the same word
+            "position": session.current_position,
+            "total_words": len(song_lyrics)
+        }
 
-# Helper function for audio recording with retry logic
-def record_audio(max_retries=3):
-    retries = 0
-    while retries < max_retries:
-        try:
-            with sr.Microphone() as source:
-                logger.info("Adjusting for ambient noise...")
-                recognizer.adjust_for_ambient_noise(source)
-                logger.info("Speak now...")
-                return recognizer.listen(source, timeout=10, phrase_time_limit=5)
-        except sr.WaitTimeoutError:
-            retries += 1
-            logger.warning(f"No speech detected, retry {retries}/{max_retries}")
-            if retries >= max_retries:
-                raise HTTPException(status_code=408, detail="No speech detected after multiple attempts")
-        except Exception as e:
-            logger.error(f"Error recording audio: {str(e)}")
-            raise
+@app.get("/song_progress/{session_id}")
+def get_progress(session_id: str):
+    # Check if session exists
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session = sessions[session_id]
+    song_lyrics = songs[session.song_id]
+    
+    return {
+        "session_id": session_id,
+        "song_id": session.song_id,
+        "current_position": session.current_position,
+        "total_words": len(song_lyrics),
+        "completed": session.completed,
+        "current_word": song_lyrics[session.current_position] if not session.completed else None,
+        "progress_percentage": round((session.current_position / len(song_lyrics)) * 100, 2)
+    }
 
-# Shutdown event handler to clean up resources
-@app.on_event("shutdown")
-def shutdown_event():
-    try:
-        logger.info("Shutting down application, cleaning up resources...")
-        # Clean up any temporary files that might still exist
-        if os.path.exists("temp.wav"):
-            os.remove("temp.wav")
-    except Exception as e:
-        logger.error(f"Error during shutdown: {str(e)}")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=9000)
+@app.get("/available_songs")
+def list_songs():
+    return {
+        "available_songs": [
+            {"id": song_id, "words": len(words)} 
+            for song_id, words in songs.items()
+        ]
+    }
